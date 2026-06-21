@@ -10,7 +10,7 @@ import {
   getDocs, deleteDoc, Firestore
 } from 'firebase/firestore';
 import {
-  getStorage, ref, uploadString, getDownloadURL,
+  getStorage, ref, uploadBytes, getDownloadURL,
   FirebaseStorage
 } from 'firebase/storage';
 
@@ -267,33 +267,32 @@ export const INITIAL_DB_CONFIG: DatabaseProviderConfig = {
 
 export const formatGHC = (amount: number): string => `GH₵${amount.toFixed(2)}`;
 
-// ─── IMAGE UPLOAD ─────────────────────────────────────────────
-// Compresses image first, then uploads to Firebase Storage.
-// Reduces a 5MB phone photo to ~150-300KB before upload.
-// Falls back to compressed base64 if Storage upload fails.
+// ─── IMAGE COMPRESSION ────────────────────────────────────────
+// Resizes to max 800px wide, 60% JPEG quality → ~80-150KB output.
+// Returns a Blob (binary) — NOT base64, so no 33% size inflation.
 
-const compressImage = (file: File, maxWidth = 1200, quality = 0.75): Promise<string> => {
+const compressImage = (file: File, maxWidth = 800, quality = 0.6): Promise<Blob> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement('canvas');
-
-        // Scale down if wider than maxWidth
         let { width, height } = img;
         if (width > maxWidth) {
           height = Math.round((height * maxWidth) / width);
           width = maxWidth;
         }
-
         canvas.width = width;
         canvas.height = height;
-        const ctx = canvas.getContext('2d')!;
-        ctx.drawImage(img, 0, 0, width, height);
+        canvas.getContext('2d')!.drawImage(img, 0, 0, width, height);
 
-        // Convert to compressed JPEG (75% quality, looks great on clothing store)
-        resolve(canvas.toDataURL('image/jpeg', quality));
+        // toBlob = raw binary, much smaller than base64 DataURL
+        canvas.toBlob(
+          (blob) => blob ? resolve(blob) : reject(new Error('Canvas toBlob failed')),
+          'image/jpeg',
+          quality
+        );
       };
       img.onerror = reject;
       img.src = e.target?.result as string;
@@ -303,21 +302,47 @@ const compressImage = (file: File, maxWidth = 1200, quality = 0.75): Promise<str
   });
 };
 
+// ─── IMAGE UPLOAD ─────────────────────────────────────────────
+// Compresses to Blob then uses uploadBytes (binary transfer).
+// uploadBytes is significantly faster than uploadString (base64).
+// A typical phone photo uploads in 5-15 seconds instead of 10-15 minutes.
+
 export const uploadImageFile = async (file: File): Promise<string> => {
   try {
     const { storage } = getFirebase();
 
-    // Compress first — brings upload time from 10-15min down to 5-15 seconds
-    const compressed = await compressImage(file);
+    // Compress to binary Blob (~80-150KB from a 5MB phone photo)
+    const blob = await compressImage(file);
 
     const path = `dfq-images/${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
     const storageRef = ref(storage, path);
-    await uploadString(storageRef, compressed, 'data_url');
-    const url = await getDownloadURL(storageRef);
-    return url; // ✅ Public Firebase Storage URL — visible to everyone
+
+    // uploadBytes sends raw binary — no base64 overhead
+    const snapshot = await uploadBytes(storageRef, blob, { contentType: 'image/jpeg' });
+    const url = await getDownloadURL(snapshot.ref);
+    return url; // ✅ Public Firebase Storage URL — visible to ALL visitors
   } catch (err) {
-    console.warn('Firebase Storage upload failed, falling back to compressed base64:', err);
-    return compressImage(file); // fallback is still compressed
+    console.warn('Firebase Storage upload failed, falling back to base64:', err);
+    // Fallback: compress and return base64 DataURL (only works on this device)
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          let { width, height } = img;
+          if (width > 800) { height = Math.round(height * 800 / width); width = 800; }
+          canvas.width = width;
+          canvas.height = height;
+          canvas.getContext('2d')!.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.6));
+        };
+        img.onerror = reject;
+        img.src = e.target?.result as string;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
   }
 };
 
@@ -338,7 +363,6 @@ export const getProducts = async (): Promise<Product[]> => {
         images: d.data().images || [d.data().image],
         archived: !!d.data().archived,
       }));
-      // Sync to localStorage as cache
       localStorage.setItem(LOCAL_PRODUCTS_KEY, JSON.stringify(products));
       return products;
     }
@@ -364,10 +388,8 @@ export const getProducts = async (): Promise<Product[]> => {
 };
 
 export const saveProducts = async (products: Product[]): Promise<void> => {
-  // Always save to localStorage immediately (instant UI response)
   localStorage.setItem(LOCAL_PRODUCTS_KEY, JSON.stringify(products));
 
-  // Then persist to Firestore (all visitors will see this)
   try {
     const { db } = getFirebase();
     await Promise.all(
@@ -388,7 +410,7 @@ export const saveProducts = async (products: Product[]): Promise<void> => {
       )
     );
 
-    // Remove products from Firestore that were deleted locally
+    // Remove deleted products from Firestore
     const { db: db2 } = getFirebase();
     const snapshot = await getDocs(collection(db2, PRODUCTS_COLLECTION));
     const localIds = new Set(products.map(p => p.id));
@@ -404,7 +426,6 @@ export const saveProducts = async (products: Product[]): Promise<void> => {
 
 // ─── SITE CONFIG ──────────────────────────────────────────────
 
-const CONFIG_DOC = 'config/siteConfig';
 const LOCAL_CONFIG_KEY = 'dfq_config';
 
 export const getConfig = async (): Promise<SiteConfig> => {
@@ -416,7 +437,6 @@ export const getConfig = async (): Promise<SiteConfig> => {
       localStorage.setItem(LOCAL_CONFIG_KEY, JSON.stringify(data));
       return data;
     }
-    // Seed Firestore with defaults
     await saveConfig(INITIAL_CONFIG);
     return INITIAL_CONFIG;
   } catch (err) {
@@ -439,7 +459,7 @@ export const saveConfig = async (config: SiteConfig): Promise<void> => {
   }
 };
 
-// ─── CART (localStorage only — per-user, no sync needed) ──────
+// ─── CART (localStorage only — per-user) ──────────────────────
 
 const LOCAL_CART_KEY = 'dfq_cart';
 
@@ -471,7 +491,7 @@ export const saveDbConfig = (cfg: DatabaseProviderConfig): void => {
   localStorage.setItem(LOCAL_DB_CONFIG_KEY, JSON.stringify(cfg));
 };
 
-// ─── ADMIN AUTH (localStorage — session only) ─────────────────
+// ─── ADMIN AUTH ───────────────────────────────────────────────
 
 export const isAdminLoggedIn = (): boolean =>
   localStorage.getItem('dfq_admin_session') === 'active';
