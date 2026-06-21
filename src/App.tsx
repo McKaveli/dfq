@@ -57,9 +57,19 @@ export const App: React.FC = () => {
 
   // Initialize from localStorage
   useEffect(() => {
-    setProducts(getProducts());
+    // Load products and site config asynchronously
+    (async () => {
+      try {
+        const loadedProducts = await getProducts();
+        setProducts(loadedProducts);
+        const loadedConfig = await getConfig();
+        setConfig(loadedConfig);
+      } catch (err) {
+        console.error('Failed to load initial data:', err);
+      }
+    })();
+    // Cart is stored locally and can be retrieved synchronously
     setCart(getCart());
-    setConfig(getConfig());
   }, []);
 
   // Safe tab navigation with authentication guard for Admin Dashboard
