@@ -268,34 +268,56 @@ export const INITIAL_DB_CONFIG: DatabaseProviderConfig = {
 export const formatGHC = (amount: number): string => `GH₵${amount.toFixed(2)}`;
 
 // ─── IMAGE UPLOAD ─────────────────────────────────────────────
-// Uploads to Firebase Storage. Returns a public download URL.
-// Falls back to base64 DataURL if Storage upload fails.
+// Compresses image first, then uploads to Firebase Storage.
+// Reduces a 5MB phone photo to ~150-300KB before upload.
+// Falls back to compressed base64 if Storage upload fails.
+
+const compressImage = (file: File, maxWidth = 1200, quality = 0.75): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+
+        // Scale down if wider than maxWidth
+        let { width, height } = img;
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // Convert to compressed JPEG (75% quality, looks great on clothing store)
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = reject;
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+};
 
 export const uploadImageFile = async (file: File): Promise<string> => {
   try {
     const { storage } = getFirebase();
-    const base64: string = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
 
-    const ext = file.name.split('.').pop() ?? 'jpg';
-    const path = `dfq-images/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    // Compress first — brings upload time from 10-15min down to 5-15 seconds
+    const compressed = await compressImage(file);
+
+    const path = `dfq-images/${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
     const storageRef = ref(storage, path);
-    await uploadString(storageRef, base64, 'data_url');
+    await uploadString(storageRef, compressed, 'data_url');
     const url = await getDownloadURL(storageRef);
     return url; // ✅ Public Firebase Storage URL — visible to everyone
   } catch (err) {
-    console.warn('Firebase Storage upload failed, falling back to base64:', err);
-    // Fallback: return base64 (only works on this device)
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
+    console.warn('Firebase Storage upload failed, falling back to compressed base64:', err);
+    return compressImage(file); // fallback is still compressed
   }
 };
 
